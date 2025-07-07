@@ -1,0 +1,9 @@
+record_type,field_1,field_2,field_3,field_4,field_5,field_6,field_7,field_8,field_9,field_10,field_11
+D,document_type,date_received,instrument_no,record_type,liber,page,empty_1,empty_2,empty_3,consideration,document_date
+N,document_type,date_received,instrument_no,record_type,grantor_grantee,combined_name,empty_1,empty_2,empty_3,empty_4,empty_5
+L,document_type,date_received,instrument_no,record_type,parcel_id,street_no,street_name,municipality,empty_3,empty_4,empty_5
+L(condo),document_type,date_received,instrument_no,record_type,plan,unit,unit_to,condominium,empty_1,empty_2,empty_3
+L(platted),document_type,date_received,instrument_no,record_type,lot,lot_to,plat_liber,plat_page,subdivision,empty_2,empty_3
+L(unplatted),document_type,date_received,instrument_no,record_type,township,range,section,quarter,empty_1,empty_2,empty_3
+L(survey),document_type,date_received,instrument_no,record_type,survey_unit,survey_no,empty_1,empty_2,empty_3,empty_4,empty_5
+
