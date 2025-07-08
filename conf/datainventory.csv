@@ -1,2 +1,9 @@
-filename
-"/home/mike/the_vault/IPDS/wc_register_of_deeds/2022_rod_transactions.csv"
+source,is_file
+"/home/mike/the_vault/IPDS/wc_register_of_deeds/2023_rod_transactions.csv",1
+"/home/mike/the_vault/IPDS/wc_register_of_deeds/2008_2019_other_document_types.csv",1
+"/home/mike/the_vault/IPDS/wc_register_of_deeds/2020_2022_other_document_types.csv",1
+raw.waynecounty_registerofdeeds_detroit_2022,0
+raw.waynecounty_registerofdeeds_detroit_2020_2021,0
+raw.waynecounty_registerofdeeds_detroit_2012_20140121,0
+raw.waynecounty_registerofdeeds_detroit_2013_20140121,0
+raw.waynecounty_registerofdeeds_detroit_2008_2011,0
