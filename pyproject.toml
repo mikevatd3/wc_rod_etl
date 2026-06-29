@@ -5,8 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "entity-analyze",
     "geopandas>=1.1.1",
-    "polars>=1.31.0",
+    "openpyxl>=3.1.5",
     "psycopg>=3.2.9",
     "sqlalchemy>=2.0.41",
 ]
+
+[tool.uv.sources]
+entity-analyze = { path = "../entity_analyze", editable = true }
