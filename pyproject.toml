@@ -12,5 +12,10 @@ dependencies = [
     "sqlalchemy>=2.0.41",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
 [tool.uv.sources]
 entity-analyze = { path = "../entity_analyze", editable = true }

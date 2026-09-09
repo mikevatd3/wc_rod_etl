@@ -1,12 +1,23 @@
 from pathlib import Path
-import csv
 import pandas as pd
-import re
 import numpy as np
 from sqlalchemy import create_engine, text
 from sqlalchemy.types import JSON
 
 from entity_analyze import breakdown_entity_name, graph_cluster
+
+from transforms import (
+    FIELD_COLUMNS,
+    V2_COLUMNS,
+    V2_DTYPES,
+    check_v2_header,
+    clean_parcel_id,
+    iter_record_groups,
+    load_record_cols,
+    normalize_v2,
+    source_layout,
+    validate_v2,
+)
 
 
 WORKING_DIR = Path(__file__).parent
@@ -14,81 +25,70 @@ WORKING_DIR = Path(__file__).parent
 engine = create_engine("postgresql+psycopg://mike@edw:5432/ipds")
 
 
-def clean_parcel_id(parcel_id: str):
-    # Remove any empty strings or nans
-    if (not parcel_id) or pd.isna(parcel_id):
-        return None
-
-    # Remove any parcel number that has been corrupted by excel
-    if re.match(r"^\d\.\d+E\+\d+", parcel_id):
-        return None
-
-    parcel_id = str(parcel_id).replace("/", "")
-
-    if (
-        ("-" not in parcel_id)
-        and ("." not in parcel_id)
-        and len(parcel_id) < 10
-    ):
-        parcel_id = parcel_id + "."
-
-    return parcel_id
-
-
 def main():
 
     # Each record type has a different schema so create a dictionary that maps
     # the row 'type' to the correct column names.
-    record_cols = {}
-    with open(WORKING_DIR / "conf" / "rownames.csv") as f:
-        reader = csv.reader(f)
+    record_cols = load_record_cols(WORKING_DIR / "conf" / "rownames.csv")
 
-        for row in reader:
-            if row:
-                record_cols[row[0]] = row[1:]
+    # Every run is a full reload, so the first write to each table replaces it
+    # and the rest append. This is tracked per table rather than per source
+    # because one source can write property_details several times -- once per
+    # legal subtype -- and each of those must not drop the previous one.
+    table_modes: dict[str, str] = {}
+
+    def write_table(frame, table, **kwargs):
+        frame.to_sql(
+            table,
+            engine,
+            schema="rod",
+            index=False,
+            if_exists=table_modes.get(table, "replace"),
+            **kwargs,
+        )
+        table_modes[table] = "append"
+
+    # parties.id is a row counter within a source, so offset it to stay unique
+    # across the whole load.
+    party_id_offset = 0
 
     # Loop through the sources in the 'datainventory.csv' sheet and load each
     # Each source could be a database table or a csv so handle each approprately
-    mode = "replace"
     inventory = pd.read_csv(WORKING_DIR / "conf" / "datainventory.csv")
     for _, source in inventory.iterrows():
-        print(f"Processing {source['source']}")
+        layout = source_layout(source)
+        print(f"Processing {source['source']} (layout={layout})")
+
+        # v1 is the original headerless 11 column export, v2 the wider one with
+        # a header row. Both are read positionally.
+        names = FIELD_COLUMNS if layout == "v1" else V2_COLUMNS
+
         if source["is_file"]:  # type: ignore
+            if layout == "v2":
+                for problem in check_v2_header(source["source"]):  # type: ignore
+                    print(f"  header mismatch -- {problem}")
+
             frame = pd.read_csv(
                 source["source"],  # type: ignore Typing nightmare
-                names=[
-                    "field_1",
-                    "field_2",
-                    "field_3",
-                    "field_4",
-                    "field_5",
-                    "field_6",
-                    "field_7",
-                    "field_8",
-                    "field_9",
-                    "field_10",
-                    "field_11",
-                ],  # see PDF docs in the vault
+                header=0 if layout == "v2" else None,  # v2 files have a header
+                names=names,  # see PDF docs in the vault
                 usecols=range(
-                    11
+                    len(names)
                 ),  # There are extra columns on a couple hundred rows
+                dtype=V2_DTYPES if layout == "v2" else None,
             )
         else:
             with engine.connect() as db:
                 frame = pd.read_sql_table(source["source"], db, schema="raw")  # type: ignore
-                frame.columns = [
-                    "field_1",
-                    "field_2",
-                    "field_3",
-                    "field_4",
-                    "field_5",
-                    "field_6",
-                    "field_7",
-                    "field_8",
-                    "field_9",
-                    "field_10",
-                    "field_11",
-                ]
+                frame.columns = names
+
+        if layout == "v2":
+            # v2 carries no record type column, so reshape it into the same
+            # positional intermediate the switchboard below already expects.
+            for key, value in validate_v2(frame).items():
+                print(f"  {key}: {value}")
+
+            frame = normalize_v2(frame)
 
         table_names = {
             "D": "documents",
@@ -96,21 +96,10 @@ def main():
             "L": "properties",
         }
 
-        record_groups = frame.groupby("field_4")
+        source_rows = len(frame)
 
-        for name, group in record_groups:
-            frame = group.copy()
-
-            # Find the columns that correspond to the group code
-            frame.columns = record_cols[name]
-
-            # The column reference loaded above notes which columns are empty so
-            # we can use that to lose the empty cols.
-            frame = frame.drop(
-                columns=[
-                    col for col in frame.columns if col.startswith("empty")
-                ]
-            )
+        for name, group in iter_record_groups(frame, record_cols):
+            frame = group
 
             # Main switchboard that directs each group
             if name.startswith("D"):
@@ -136,13 +125,7 @@ def main():
                     ).dt.date
                 )
 
-                frame.to_sql(
-                    table_names[name],  # type: ignore
-                    engine,
-                    schema="rod",
-                    index=False,
-                    if_exists=mode,
-                )
+                write_table(frame, table_names[name])  # type: ignore
 
             if name.startswith("N"):
                 # These are the party rows -- they have information about the
@@ -152,13 +135,8 @@ def main():
                 )
 
                 frame = frame.reset_index().rename(columns={"index": "id"})
-                frame.to_sql(
-                    table_names[name],  # type: ignore
-                    engine,
-                    schema="rod",
-                    index=False,
-                    if_exists=mode,
-                )
+                frame["id"] += party_id_offset
+                write_table(frame, table_names[name])  # type: ignore
 
             if name.startswith("L"):
                 frame = frame.drop(
@@ -182,28 +160,17 @@ def main():
                     )
                     frame = frame.drop(columns=data_cols)
 
-                    frame.to_sql(
-                        "property_details",
-                        engine,
-                        schema="rod",
-                        dtype={"data": JSON},
-                        index=False,
-                        if_exists=mode,
+                    write_table(
+                        frame, "property_details", dtype={"data": JSON}
                     )
                 else:
 
                     frame["parcel_id"] = frame["parcel_id"].apply(
                         clean_parcel_id
                     )
-                    frame.to_sql(
-                        table_names[name],  # type: ignore
-                        engine,
-                        schema="rod",
-                        index=False,
-                        if_exists=mode,
-                    )
+                    write_table(frame, table_names[name])  # type: ignore
 
-        mode = "append"
+        party_id_offset += source_rows
 
     # Run hard deduplication and naive_name_dedupe queries
     qs = [

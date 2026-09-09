@@ -1,0 +1,411 @@
+"""Source-layout handling for the ROD loader.
+
+Two source layouts exist:
+
+``v1``
+    The original headerless 11-column export. Column 4 carries a record-type
+    code (``D``, ``N``, ``L``, ``L(platted)``, ...) and ``conf/rownames.csv``
+    maps that code to the column names for the rest of the row.
+
+``v2``
+    The newer 19-column export, which *has* a header row and *no* record-type
+    column. The document-level fields are repeated on every row and the record
+    type is implicit in which columns are populated: ``PARTY_NAME`` means a
+    grantor, ``PARTY_NAME2`` a grantee, ``TAX_ID1``/``ADDRESS`` a property.
+
+``normalize_v2`` reshapes a v2 frame into the v1 positional intermediate so the
+switchboard in ``main.py`` -- and everything in ``sql/`` that depends on the
+resulting column names -- stays unchanged.
+
+This module deliberately imports nothing but pandas/numpy so it can be tested
+without a database, without the ``entity_analyze`` sibling package, and without
+the source files in the vault.
+"""
+
+from pathlib import Path
+import csv
+import re
+
+import pandas as pd
+
+# The v1 positional intermediate every source is reshaped into.
+FIELD_COLUMNS = [f"field_{i}" for i in range(1, 12)]
+
+# The v2 header, in order. Read positionally, like v1, but verified against the
+# file's own header row by check_v2_header.
+V2_COLUMNS = [
+    "DOC_TYPE_CODE",
+    "RECORDED_DATE_TIME",
+    "CF_VCINSTNUM",
+    "LIBER",
+    "CONSIDERATION",
+    "DM_INSTRUMENT",
+    "PARTY_NAME",
+    "PARTY_NAME2",
+    "TAX_ID1",
+    "ADDRESS",
+    "MUNICIPALITY",
+    "Textbox18",
+    "PLAT_LIBER",
+    "Textbox20",
+    "PLAT_PAGE",
+    "Textbox22",
+    "LOT",
+    "Textbox59",
+    "Textbox61",
+]
+
+# Document-level fields, repeated on every v2 row. Documents are the distinct
+# tuples over these -- there is no dedicated document row in v2.
+V2_DOC_COLUMNS = V2_COLUMNS[:6]
+
+# Read everything as text, as the headerless v1 read effectively does. This
+# matters for TAX_ID1: if a chunk of it were all scientific notation pandas
+# would infer float64 and clean_parcel_id's re.match would raise rather than
+# return None. CF_VCINSTNUM is left to infer so instrument_no keeps the dtype
+# v1 produces.
+V2_DTYPES = {col: str for col in V2_COLUMNS if col != "CF_VCINSTNUM"}
+
+# The report generator emits its own field labels as data. They carry no
+# information, but a shifted column shows up here first.
+V2_LABELS = {
+    "Textbox18": "Plat Liber:",
+    "Textbox20": "Plat Page:",
+    "Textbox22": "Lot:",
+}
+
+# A leading street number: 112, 1234A, 1234-1/2. Anything that does not match
+# leaves street_no empty rather than putting a word like 'PO' in it, which
+# would corrupt the properties dedupe key in sql/0001.
+ADDRESS_PATTERN = (
+    r"^\s*(?P<street_no>\d+(?:[-/]\d+)*[A-Za-z]?)\s+(?P<street_name>.*?)\s*$"
+)
+
+
+def clean_parcel_id(parcel_id: str):
+    # Remove any empty strings or nans
+    if (not parcel_id) or pd.isna(parcel_id):
+        return None
+
+    # Remove any parcel number that has been corrupted by excel
+    if re.match(r"^\d\.\d+E\+\d+", parcel_id):
+        return None
+
+    parcel_id = str(parcel_id).replace("/", "")
+
+    if (
+        ("-" not in parcel_id)
+        and ("." not in parcel_id)
+        and len(parcel_id) < 10
+    ):
+        parcel_id = parcel_id + "."
+
+    return parcel_id
+
+
+def load_record_cols(path: Path) -> dict[str, list[str]]:
+    """Read conf/rownames.csv into {record code: [column names]}."""
+    record_cols = {}
+    with open(path) as f:
+        reader = csv.reader(f)
+
+        for row in reader:
+            if row:
+                record_cols[row[0]] = row[1:]
+
+    return record_cols
+
+
+def iter_record_groups(frame: pd.DataFrame, record_cols: dict[str, list[str]]):
+    """Split a field_1..field_11 frame by record type, naming the columns.
+
+    Yields (code, frame) pairs with the positional fields renamed per
+    conf/rownames.csv and the columns that reference notes as empty dropped.
+    """
+    for name, group in frame.groupby("field_4"):
+        out = group.copy()
+
+        # Find the columns that correspond to the group code
+        out.columns = record_cols[name]
+
+        # The column reference notes which columns are empty so we can use that
+        # to lose the empty cols.
+        out = out.drop(
+            columns=[col for col in out.columns if col.startswith("empty")]
+        )
+
+        yield name, out
+
+
+def source_layout(source: pd.Series) -> str:
+    """The layout declared for one row of conf/datainventory.csv.
+
+    A missing column, an empty cell, or whitespace all mean the original v1
+    layout. Note that a blank cell reads as NaN, which is truthy -- so this
+    cannot be written as `source.get("layout") or "v1"`.
+    """
+    layout = source.get("layout", "v1")
+
+    if pd.isna(layout) or not str(layout).strip():
+        return "v1"
+
+    return str(layout).strip().lower()
+
+
+def _as_text(series: pd.Series) -> pd.Series:
+    """An object-dtype view, so the .str accessor is always available."""
+    if series.dtype == object:
+        return series
+
+    return series.astype(object).where(series.notna())
+
+
+def _strip(series: pd.Series) -> pd.Series:
+    """Trim text columns; leave anything else (e.g. the instrument no) alone."""
+    if series.dtype != object:
+        return series
+
+    return series.str.strip()
+
+
+def _blank_to_none(series: pd.Series) -> pd.Series:
+    # Via the object view: a column that is entirely absent arrives as float64,
+    # and None written into a float column silently becomes NaN again.
+    series = _as_text(series)
+
+    return series.where(series.notna() & series.ne(""), None)
+
+
+def _filled(series: pd.Series) -> pd.Series:
+    """True where the cell holds something other than whitespace."""
+    if series.dtype != object:
+        return series.notna()
+
+    return series.notna() & series.str.strip().ne("")
+
+
+def split_liber(series: pd.Series) -> pd.DataFrame:
+    """'58620:573' -> liber '58620', page '573'. No colon leaves page empty."""
+    parts = (
+        _as_text(series)
+        .str.split(":", n=1, expand=True)
+        .reindex(columns=[0, 1])
+        .set_axis(["liber", "page"], axis=1)
+    )
+
+    return parts.apply(lambda col: _blank_to_none(_strip(col)))
+
+
+def split_address(series: pd.Series) -> pd.DataFrame:
+    """'112 EDISON ' -> street_no '112', street_name 'EDISON'.
+
+    An address with no leading street number keeps its whole text as the street
+    name rather than losing the first word to street_no.
+    """
+    text = _as_text(series)
+    out = text.str.extract(ADDRESS_PATTERN)
+
+    unmatched = out["street_name"].isna() & text.notna()
+    out.loc[unmatched, "street_name"] = text[unmatched].str.strip()
+
+    return out.apply(_blank_to_none)
+
+
+def _base(frame: pd.DataFrame, code: str) -> pd.DataFrame:
+    """The doc-level slots plus the record code, aligned to frame's index."""
+    return pd.DataFrame(
+        {
+            "field_1": _strip(frame["DOC_TYPE_CODE"]),
+            "field_2": _strip(frame["RECORDED_DATE_TIME"]),
+            "field_3": frame["CF_VCINSTNUM"],
+            "field_4": code,
+        },
+        index=frame.index,
+    )
+
+
+def v2_documents(frame: pd.DataFrame) -> pd.DataFrame:
+    """One D row per distinct document-level tuple.
+
+    v2 has no document record, so the documents are the distinct values of the
+    six leading columns that every row repeats.
+    """
+    doc = frame[V2_DOC_COLUMNS].apply(_strip).drop_duplicates()
+
+    out = _base(doc, "D")
+    liber = split_liber(doc["LIBER"])
+    out["field_5"] = liber["liber"]
+    out["field_6"] = liber["page"]
+    # Consideration stays a verbatim string ('33,500.00'): sql/0001 dedupes on
+    # the literal value, so parsing it here would stop v2 rows collapsing
+    # against the v1 rows for the same document.
+    out["field_10"] = _blank_to_none(doc["CONSIDERATION"])
+    # DM_INSTRUMENT is the document date, despite the name.
+    out["field_11"] = _blank_to_none(doc["DM_INSTRUMENT"])
+
+    return out.reindex(columns=FIELD_COLUMNS)
+
+
+def v2_parties(frame: pd.DataFrame) -> pd.DataFrame:
+    """One N row per populated party column. R is a grantor, E a grantee."""
+    groups = []
+
+    for column, role in (("PARTY_NAME", "R"), ("PARTY_NAME2", "E")):
+        rows = frame[_filled(frame[column])]
+
+        out = _base(rows, "N")
+        out["field_5"] = role
+        out["field_6"] = rows[column].str.strip()
+
+        groups.append(out.reindex(columns=FIELD_COLUMNS))
+
+    return pd.concat(groups).drop_duplicates()
+
+
+def v2_properties(frame: pd.DataFrame) -> pd.DataFrame:
+    """One L row per populated parcel/address. Multi-lot rows collapse here."""
+    rows = frame[_filled(frame["TAX_ID1"]) | _filled(frame["ADDRESS"])]
+
+    out = _base(rows, "L")
+    # clean_parcel_id runs in main's L branch, as it does for v1.
+    out["field_5"] = _blank_to_none(_strip(rows["TAX_ID1"]))
+    address = split_address(rows["ADDRESS"])
+    out["field_6"] = address["street_no"]
+    out["field_7"] = address["street_name"]
+    out["field_8"] = _blank_to_none(_strip(rows["MUNICIPALITY"]))
+
+    return out.reindex(columns=FIELD_COLUMNS).drop_duplicates()
+
+
+def v2_platted(frame: pd.DataFrame) -> pd.DataFrame:
+    """One L(platted) row per lot.
+
+    v2 carries no lot_to or subdivision, but both slots are emitted so the JSON
+    in rod.property_details has the same shape it does for v1.
+    """
+    rows = frame[
+        _filled(frame["LOT"])
+        | _filled(frame["PLAT_LIBER"])
+        | _filled(frame["PLAT_PAGE"])
+    ]
+
+    out = _base(rows, "L(platted)")
+    out["field_5"] = _blank_to_none(_strip(rows["LOT"]))  # lot
+    out["field_6"] = None  # lot_to -- absent in v2
+    out["field_7"] = _blank_to_none(_strip(rows["PLAT_LIBER"]))
+    out["field_8"] = _blank_to_none(_strip(rows["PLAT_PAGE"]))
+    out["field_9"] = None  # subdivision -- absent in v2
+
+    return out.reindex(columns=FIELD_COLUMNS).drop_duplicates()
+
+
+def normalize_v2(frame: pd.DataFrame) -> pd.DataFrame:
+    """Reshape one v2 source into the v1 field_1..field_11 intermediate."""
+    frame = frame.reset_index(drop=True)
+
+    return pd.concat(
+        [
+            v2_documents(frame),
+            v2_parties(frame),
+            v2_properties(frame),
+            v2_platted(frame),
+        ],
+        ignore_index=True,
+    )
+
+
+def validate_v2(frame: pd.DataFrame) -> dict[str, int]:
+    """Non-fatal counts worth reading in the log before a v2 load."""
+    grantor = _filled(frame["PARTY_NAME"])
+    grantee = _filled(frame["PARTY_NAME2"])
+    property_row = _filled(frame["TAX_ID1"]) | _filled(frame["ADDRESS"])
+
+    doc_fields = frame[V2_DOC_COLUMNS].apply(_strip)
+    conflicts = (
+        doc_fields.groupby(frame["CF_VCINSTNUM"])
+        .nunique()
+        .gt(1)
+        .any(axis=1)
+        .sum()
+    )
+
+    unexpected_labels = 0
+    for column, label in V2_LABELS.items():
+        values = _strip(_as_text(frame[column]))
+        unexpected_labels += int((values.notna() & values.ne(label)).sum())
+
+    parcels = _as_text(frame["TAX_ID1"])
+    dropped = parcels[parcels.notna()].map(
+        lambda value: clean_parcel_id(value) is None
+    )
+
+    addresses = split_address(frame["ADDRESS"])
+
+    return {
+        "rows": len(frame),
+        "rows_unclassified": int((~grantor & ~grantee & ~property_row).sum()),
+        "rows_both_party_cols": int((grantor & grantee).sum()),
+        "instruments_with_conflicting_doc_fields": int(conflicts),
+        "addresses_without_street_no": int(
+            (addresses["street_name"].notna() & addresses["street_no"].isna())
+            .sum()
+        ),
+        "unexpected_labels": unexpected_labels,
+        "parcel_ids_dropped": int(dropped.sum()),
+    }
+
+
+def check_v2_header(path: Path) -> list[str]:
+    """Columns the file's header disagrees with. Empty means it matches."""
+    with open(path) as f:
+        header = next(csv.reader(f), [])
+
+    return [
+        f"{position}: expected {expected!r}, found {found!r}"
+        for position, (expected, found) in enumerate(
+            zip(V2_COLUMNS, header + [None] * len(V2_COLUMNS))
+        )
+        if expected != found
+    ] + (
+        [f"expected {len(V2_COLUMNS)} columns, found {len(header)}"]
+        if len(header) != len(V2_COLUMNS)
+        else []
+    )
+
+
+def read_v2(path) -> pd.DataFrame:
+    """Read a v2 CSV. Unlike v1 these files have a header row."""
+    return pd.read_csv(
+        path,
+        header=0,
+        names=V2_COLUMNS,
+        usecols=range(len(V2_COLUMNS)),
+        dtype=V2_DTYPES,
+    )
+
+
+if __name__ == "__main__":
+    # Dry run against a v2 file, no database:
+    #     python transforms.py rod_new_schema_example.csv
+    import sys
+
+    source = Path(sys.argv[1])
+
+    problems = check_v2_header(source)
+    if problems:
+        print("Header does not match the expected v2 layout:")
+        for problem in problems:
+            print(f"  {problem}")
+
+    frame = read_v2(source)
+
+    for key, value in validate_v2(frame).items():
+        print(f"{key}: {value}")
+
+    record_cols = load_record_cols(
+        Path(__file__).parent / "conf" / "rownames.csv"
+    )
+
+    for name, group in iter_record_groups(normalize_v2(frame), record_cols):
+        print(f"\n=== {name} ({len(group)} rows) ===")
+        print(group.head(10).to_string(index=False))
