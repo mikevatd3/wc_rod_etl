@@ -1,8 +1,10 @@
+import os
 from pathlib import Path
 import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine, text
 from sqlalchemy.types import JSON
+from dotenv import load_dotenv
 
 from entity_analyze import breakdown_entity_name, graph_cluster
 
@@ -26,6 +28,8 @@ engine = create_engine("postgresql+psycopg://mike@edw:5432/ipds")
 
 
 def main():
+    load_dotenv()
+    vault_location = Path(os.getenv("VAULT_LOCATION", "mnt/v"))
 
     # Each record type has a different schema so create a dictionary that maps
     # the row 'type' to the correct column names.
@@ -69,9 +73,20 @@ def main():
                     print(f"  header mismatch -- {problem}")
 
             frame = pd.read_csv(
-                source["source"],  # type: ignore Typing nightmare
-                header=0 if layout == "v2" else None,  # v2 files have a header
-                names=names,  # see PDF docs in the vault
+                vault_location / source["source"],  # type: ignore Typing nightmare
+                names=[
+                    "field_1",
+                    "field_2",
+                    "field_3",
+                    "field_4",
+                    "field_5",
+                    "field_6",
+                    "field_7",
+                    "field_8",
+                    "field_9",
+                    "field_10",
+                    "field_11",
+                ],  # see PDF docs in the vault
                 usecols=range(
                     len(names)
                 ),  # There are extra columns on a couple hundred rows
