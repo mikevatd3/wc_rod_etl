@@ -13,7 +13,9 @@ Two source layouts are supported, declared per source in the `layout` column of 
 - **`v1`** — the original headerless 11-column export. Column 4 holds a record-type code (`D`, `N`, `L`, `L(condo)`, …) and `conf/rownames.csv` maps that code to the names of the remaining columns.
 - **`v2`** — the newer 19-column export. It *has* a header row and *no* record-type column: the document-level fields repeat on every row and the record type is implicit in which columns are populated (`PARTY_NAME` = grantor, `PARTY_NAME2` = grantee, `TAX_ID1`/`ADDRESS` = property). `PLAT_LIBER`/`PLAT_PAGE`/`LOT` become `property_details` rows of type `platted`. `LIBER` is a composite `liber:page`, `ADDRESS` combines street number and name, and `DM_INSTRUMENT` is the document date despite its name. The `Textbox*` columns are report-generator labels and carry no data.
 
-`transforms.py:normalize_v2` reshapes a v2 frame into the v1 positional intermediate, so both layouts land in the same `rod.*` tables with the same column names and nothing in `sql/` has to change. `layout` is orthogonal to `is_file`, so a v2 source staged as a `raw.*` table works too.
+v1 is read positionally; **v2 is read by column name** from the file's own header (`transforms.py:read_v2`), so a v2 export can gain, lose or reorder columns and still load — extra columns are ignored, the optional `Textbox*` labels are filled in when absent, and a genuinely missing data column raises an error naming it. Selecting by name also absorbs the stray extra fields these exports carry on a handful of rows.
+
+`transforms.py:normalize_v2` then reshapes a v2 frame into the v1 positional intermediate, so both layouts land in the same `rod.*` tables with the same column names and nothing in `sql/` has to change. `layout` is orthogonal to `is_file`, so a v2 source staged as a `raw.*` table works too.
 
 Sample: `rod_new_schema_example.csv`.
 

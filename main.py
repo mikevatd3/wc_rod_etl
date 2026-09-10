@@ -10,13 +10,13 @@ from entity_analyze import breakdown_entity_name, graph_cluster
 
 from transforms import (
     FIELD_COLUMNS,
-    V2_COLUMNS,
-    V2_DTYPES,
+    align_v2,
     check_v2_header,
     clean_parcel_id,
     iter_record_groups,
     load_record_cols,
     normalize_v2,
+    read_v2,
     source_layout,
     validate_v2,
 )
@@ -63,39 +63,32 @@ def main():
         layout = source_layout(source)
         print(f"Processing {source['source']} (layout={layout})")
 
-        # v1 is the original headerless 11 column export, v2 the wider one with
-        # a header row. Both are read positionally.
-        names = FIELD_COLUMNS if layout == "v1" else V2_COLUMNS
-
         if source["is_file"]:  # type: ignore
-            if layout == "v2":
-                for problem in check_v2_header(source["source"]):  # type: ignore
-                    print(f"  header mismatch -- {problem}")
+            path = vault_location / source["source"]  # type: ignore
 
-            frame = pd.read_csv(
-                vault_location / source["source"],  # type: ignore Typing nightmare
-                names=[
-                    "field_1",
-                    "field_2",
-                    "field_3",
-                    "field_4",
-                    "field_5",
-                    "field_6",
-                    "field_7",
-                    "field_8",
-                    "field_9",
-                    "field_10",
-                    "field_11",
-                ],  # see PDF docs in the vault
-                usecols=range(
-                    len(names)
-                ),  # There are extra columns on a couple hundred rows
-                dtype=V2_DTYPES if layout == "v2" else None,
-            )
+            if layout == "v2":
+                # v2 files carry a header, so they are read by name -- no
+                # positional names, and the column count can change.
+                for problem in check_v2_header(path):
+                    print(f"  header -- {problem}")
+
+                frame = read_v2(path)
+            else:
+                frame = pd.read_csv(
+                    path,
+                    names=FIELD_COLUMNS,  # see PDF docs in the vault
+                    usecols=range(
+                        len(FIELD_COLUMNS)
+                    ),  # There are extra columns on a couple hundred rows
+                )
         else:
             with engine.connect() as db:
                 frame = pd.read_sql_table(source["source"], db, schema="raw")  # type: ignore
-                frame.columns = names
+
+                if layout == "v2":
+                    frame = align_v2(frame)
+                else:
+                    frame.columns = FIELD_COLUMNS
 
         if layout == "v2":
             # v2 carries no record type column, so reshape it into the same

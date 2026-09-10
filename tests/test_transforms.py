@@ -10,6 +10,8 @@ import pandas as pd
 import pytest
 
 from transforms import (
+    V2_COLUMNS,
+    align_v2,
     check_v2_header,
     clean_parcel_id,
     iter_record_groups,
@@ -262,14 +264,49 @@ def test_source_layout(row, expected):
     assert source_layout(pd.Series(row)) == expected
 
 
-def test_check_v2_header_reports_a_shifted_column(tmp_path):
+def test_check_v2_header_reports_unknown_and_missing_columns(tmp_path):
     bad = tmp_path / "bad.csv"
     bad.write_text("DOC_TYPE_CODE,SURPRISE,CF_VCINSTNUM\n")
 
     problems = check_v2_header(bad)
 
-    assert any("SURPRISE" in problem for problem in problems)
-    assert any("expected 19 columns" in problem for problem in problems)
+    assert any("unexpected column 'SURPRISE'" in problem for problem in problems)
+    assert any("missing column 'PARTY_NAME'" in problem for problem in problems)
+
+
+def test_align_ignores_extra_columns_and_fills_absent_labels(sample):
+    # A v2 export that gained a column and dropped the label columns still
+    # loads: the count and order of the columns no longer matter.
+    frame = sample.drop(columns=["Textbox59", "Textbox61", "Textbox22"])
+    frame["SOMETHING_NEW"] = "x"
+
+    aligned = align_v2(frame)
+
+    assert list(aligned.columns) == list(sample.columns)
+    assert aligned["Textbox22"].isna().all()
+    assert len(v2_documents(aligned)) == 7
+
+
+def test_align_reads_by_name_not_position(sample):
+    shuffled = sample[list(reversed(sample.columns))]
+
+    aligned = align_v2(shuffled)
+
+    assert list(aligned.columns) == list(sample.columns)
+    assert len(v2_parties(aligned)) == 23
+
+
+def test_align_tolerates_padded_header_names(sample):
+    padded = sample.rename(columns=lambda col: f" {col} ")
+
+    assert list(align_v2(padded).columns) == list(sample.columns)
+
+
+def test_align_raises_on_a_missing_data_column(sample):
+    # Treating a genuinely absent data column as empty would silently drop
+    # records, so this has to be loud.
+    with pytest.raises(ValueError, match="PARTY_NAME2"):
+        align_v2(sample.drop(columns=["PARTY_NAME2"]))
 
 
 def test_empty_input_does_not_blow_up():
@@ -309,3 +346,66 @@ def test_v1_records_still_split_the_way_they_always_did():
         "unit_to",
         "condominium",
     ]
+
+
+
+def _write_v2(path, header, rows):
+    path.write_text(
+        "\n".join([",".join(header)] + [",".join(row) for row in rows]) + "\n"
+    )
+    return path
+
+
+def test_read_v2_survives_a_different_column_count(tmp_path):
+    # The real exports do not all have the sample's 19 columns. Reading by name
+    # means gaining a column, losing the label columns, and reordering are all
+    # non-events.
+    header = [c for c in V2_COLUMNS if not c.startswith("Textbox")]
+    header = list(reversed(header)) + ["GRANTOR_ADDRESS"]
+    row = {
+        "DOC_TYPE_CODE": "DD",
+        "RECORDED_DATE_TIME": "2024-01-02",
+        "CF_VCINSTNUM": "2024005182",
+        "LIBER": "58620:573",
+        "CONSIDERATION": "0",
+        "DM_INSTRUMENT": "2023-12-15",
+        "PARTY_NAME": "SMITH HARRY J",
+        "PARTY_NAME2": "",
+        "TAX_ID1": "",
+        "ADDRESS": "",
+        "MUNICIPALITY": "",
+        "PLAT_LIBER": "",
+        "PLAT_PAGE": "",
+        "LOT": "",
+        "GRANTOR_ADDRESS": "somewhere",
+    }
+
+    frame = read_v2(_write_v2(tmp_path / "v2.csv", header, [[row[c] for c in header]]))
+
+    assert list(frame.columns) == V2_COLUMNS
+    assert len(v2_documents(frame)) == 1
+    assert v2_parties(frame).iloc[0]["field_6"] == "SMITH HARRY J"
+
+
+def test_read_v2_absorbs_stray_extra_fields(tmp_path):
+    # "There are extra columns on a couple hundred rows" -- the v1 reader used
+    # usecols for this; naming the columns does the same job without dropping
+    # the row.
+    header = list(V2_COLUMNS)
+    good = ["DD", "2024-01-02", "2024005182", "58620:573", "0", "2023-12-15"] + [""] * 13
+    ragged = list(good) + ["junk", "more junk"]
+
+    frame = read_v2(_write_v2(tmp_path / "ragged.csv", header, [good, ragged]))
+
+    assert list(frame.columns) == V2_COLUMNS
+    assert len(frame) == 2
+
+
+def test_read_v2_names_the_missing_columns_and_the_real_header(tmp_path):
+    bad = _write_v2(tmp_path / "bad.csv", ["DOC_TYPE_CODE", "WHO_KNOWS"], [["DD", "x"]])
+
+    with pytest.raises(ValueError) as error:
+        read_v2(bad)
+
+    assert "CF_VCINSTNUM" in str(error.value)
+    assert "WHO_KNOWS" in str(error.value)  # shows what the file actually has

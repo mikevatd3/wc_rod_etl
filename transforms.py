@@ -66,8 +66,14 @@ V2_DOC_COLUMNS = V2_COLUMNS[:6]
 # v1 produces.
 V2_DTYPES = {col: str for col in V2_COLUMNS if col != "CF_VCINSTNUM"}
 
+# The Textbox columns are report-generator labels, so a file without them is
+# still perfectly loadable. Everything else has to be there.
+V2_REQUIRED_COLUMNS = [
+    col for col in V2_COLUMNS if not col.startswith("Textbox")
+]
+
 # The report generator emits its own field labels as data. They carry no
-# information, but a shifted column shows up here first.
+# information, but a label landing under the wrong name shows up here first.
 V2_LABELS = {
     "Textbox18": "Plat Liber:",
     "Textbox20": "Plat Page:",
@@ -355,33 +361,85 @@ def validate_v2(frame: pd.DataFrame) -> dict[str, int]:
     }
 
 
-def check_v2_header(path: Path) -> list[str]:
-    """Columns the file's header disagrees with. Empty means it matches."""
-    with open(path) as f:
-        header = next(csv.reader(f), [])
+def align_v2(frame: pd.DataFrame) -> pd.DataFrame:
+    """Select the v2 columns by name, in the order the transform expects.
 
-    return [
-        f"{position}: expected {expected!r}, found {found!r}"
-        for position, (expected, found) in enumerate(
-            zip(V2_COLUMNS, header + [None] * len(V2_COLUMNS))
+    v2 files carry a header, so they are read by name rather than by position.
+    That means a source can gain, lose or reorder columns without breaking the
+    load: extra columns are ignored and the optional label columns are filled
+    in when absent. A missing data column is an error, because silently
+    treating it as empty would quietly drop records.
+    """
+    frame = frame.rename(columns=lambda col: str(col).strip())
+
+    missing = [col for col in V2_REQUIRED_COLUMNS if col not in frame.columns]
+    if missing:
+        raise ValueError(
+            f"v2 source is missing {len(missing)} required column(s): "
+            f"{', '.join(missing)}. Found: {', '.join(map(str, frame.columns))}"
         )
-        if expected != found
-    ] + (
-        [f"expected {len(V2_COLUMNS)} columns, found {len(header)}"]
-        if len(header) != len(V2_COLUMNS)
-        else []
-    )
+
+    return frame.reindex(columns=V2_COLUMNS)
+
+
+def check_v2_header(path: Path) -> list[str]:
+    """Differences between a v2 file's header and the expected layout.
+
+    Everything reported here is survivable -- align_v2 raises on the ones that
+    are not -- but they are worth seeing in the log.
+    """
+    with open(path) as f:
+        header = [column.strip() for column in next(csv.reader(f), [])]
+
+    problems = []
+
+    for column in V2_COLUMNS:
+        if column not in header:
+            problems.append(f"missing column {column!r}")
+
+    for column in header:
+        if column not in V2_COLUMNS:
+            problems.append(f"unexpected column {column!r} (ignored)")
+
+    present = [column for column in header if column in V2_COLUMNS]
+    if present != [column for column in V2_COLUMNS if column in header]:
+        problems.append("columns are in a different order (read by name)")
+
+    return problems
+
+
+def _read_header(path) -> list[str]:
+    with open(path, newline="") as f:
+        return next(csv.reader(f), [])
 
 
 def read_v2(path) -> pd.DataFrame:
-    """Read a v2 CSV. Unlike v1 these files have a header row."""
-    return pd.read_csv(
-        path,
-        header=0,
-        names=V2_COLUMNS,
-        usecols=range(len(V2_COLUMNS)),
-        dtype=V2_DTYPES,
-    )
+    """Read a v2 CSV, selecting columns by the file's own header.
+
+    Nothing is passed positionally: the file decides how many columns it has
+    and in what order. Naming the columns in usecols also absorbs the stray
+    extra fields these exports carry on a handful of rows, which would
+    otherwise abort the parse.
+    """
+    header = _read_header(path)
+
+    missing = [
+        col
+        for col in V2_REQUIRED_COLUMNS
+        if col not in {name.strip() for name in header}
+    ]
+    if missing:
+        raise ValueError(
+            f"{path} is not a v2 source -- missing {len(missing)} required "
+            f"column(s): {', '.join(missing)}. "
+            f"Its header is: {', '.join(header)}"
+        )
+
+    # Match on the raw names so a padded header still selects, then let
+    # align_v2 trim the names and order them.
+    wanted = [name for name in header if name.strip() in V2_COLUMNS]
+
+    return align_v2(pd.read_csv(path, header=0, usecols=wanted, dtype=V2_DTYPES))
 
 
 if __name__ == "__main__":
