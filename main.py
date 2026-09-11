@@ -2,7 +2,6 @@ import os
 from decimal import Decimal
 from pathlib import Path
 import pandas as pd
-import numpy as np
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.types import JSON
 from dotenv import load_dotenv
@@ -211,11 +210,12 @@ def main():
                     _, t = name.split("(")  # type: ignore
 
                     frame["type"] = t[:-1]  # Skip closing brace
-                    frame["data"] = (
-                        frame[data_cols]
-                        .fillna(value=np.nan)
-                        .replace(np.nan, None)
-                        .apply(lambda row: row[data_cols].to_dict(), axis=1)
+                    # Nulls have to reach the JSON as None, not NaN. Doing
+                    # it with .where avoids the deprecated downcasting that
+                    # .fillna/.replace does on an object frame.
+                    details = frame[data_cols].astype(object)
+                    frame["data"] = details.where(details.notna(), None).apply(
+                        lambda row: row.to_dict(), axis=1
                     )
                     frame = frame.drop(columns=data_cols)
 
@@ -239,12 +239,20 @@ def main():
 
     with engine.begin() as db:  # begin auto-commits
         for q in qs:
-            db.execute(text(Path(q).read_text()))
+            db.execute(text((WORKING_DIR / q).read_text()))
 
-    # Parse name for easier advanced deduplication
-    q = "sql/0004_to_name_parse.sql"
+    # Parse name for easier advanced deduplication. naive_name_dedupe is a
+    # dense rank over the trimmed name, so this is one row per distinct name.
+    names_query = """
+    SELECT DISTINCT
+        naive_name_dedupe,
+        TRIM(combined_name) AS example
+    FROM rod.parties
+    WHERE combined_name IS NOT NULL;
+    """
+
     print("Loading dataset from EDW")
-    frame = pd.read_sql(text(query_path.read_text()), engine)
+    frame = pd.read_sql(text(names_query), engine)
 
     print("Breaking down example field")
     frame[
@@ -301,7 +309,7 @@ def main():
     clusters = graph_cluster(frame)
     clusters.to_sql(
         "party_name_clusters",
-        db,
+        engine,
         schema="rod",
         index=False,
         if_exists="replace",
