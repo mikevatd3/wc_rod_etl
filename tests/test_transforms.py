@@ -13,11 +13,13 @@ from transforms import (
     V2_COLUMNS,
     align_v2,
     check_v2_header,
+    coerce_to_kinds,
     detect_encoding,
     clean_parcel_id,
     iter_record_groups,
     load_record_cols,
     normalize_v2,
+    parse_consideration,
     read_v2,
     source_layout,
     split_address,
@@ -125,13 +127,40 @@ def test_documents_split_the_composite_liber(sample):
     assert documents.loc[2024005182, "field_6"] == "573"
 
 
-def test_consideration_stays_a_verbatim_string(sample):
-    # sql/0001 dedupes documents on the literal value, so parsing this to a
-    # number here would stop v2 rows collapsing against v1 rows.
+def test_consideration_is_carried_through_unparsed(sample):
+    # The intermediate keeps the file's own text; parse_consideration does the
+    # conversion at the write boundary for both layouts.
     documents = v2_documents(sample).set_index("field_3")
 
     assert documents.loc[2024004735, "field_10"] == "33,500.00"
     assert documents.loc[2024005182, "field_10"] == "0"
+
+
+def test_parse_consideration_matches_the_double_precision_column():
+    # rod.documents.consideration is double precision -- v1 lands a number
+    # there, so v2's formatted text has to become the same number.
+    parsed = parse_consideration(
+        pd.Series(["33,500.00", "0", "72,000.00", "$1,250", "", None, "N/A"])
+    )
+
+    assert list(parsed[:4]) == [33500.0, 0.0, 72000.0, 1250.0]
+    assert parsed[4:].isna().all()
+    assert parsed.dtype == "float64"
+
+
+def test_parse_consideration_leaves_numeric_input_alone():
+    # v1 sources already arrive as numbers; this must be a no-op for them.
+    parsed = parse_consideration(pd.Series([33500.0, 0.0, None]))
+
+    assert list(parsed[:2]) == [33500.0, 0.0]
+    assert parsed.dtype == "float64"
+
+
+def test_parse_consideration_survives_an_all_empty_column():
+    parsed = parse_consideration(pd.Series([None, None], dtype=object))
+
+    assert parsed.isna().all()
+    assert parsed.dtype == "float64"
 
 
 def test_document_date_comes_from_dm_instrument(sample):
@@ -454,3 +483,56 @@ def test_detect_encoding_reads_across_chunk_boundaries(tmp_path):
     path.write_text("A\n" + ("x" * 5000) + "\u00e9\n", encoding="utf-8")
 
     assert detect_encoding(path, chunk_size=64) == "utf-8"
+
+
+
+def test_coerce_casts_text_into_an_existing_numeric_column():
+    # The real failure: rod.documents.consideration is double precision and v2
+    # writes '33,500.00'.
+    frame = pd.DataFrame({"consideration": ["33,500.00", "0"]})
+
+    out, notes = coerce_to_kinds(frame, {"consideration": "numeric"})
+
+    assert list(out["consideration"]) == [33500.0, 0.0]
+    assert any("consideration" in note for note in notes)
+
+
+def test_coerce_casts_numbers_into_an_existing_text_column():
+    # The mirror image: v1 inferred street_no as a number, v2 writes '112'.
+    frame = pd.DataFrame({"street_no": [112.0, 19251.0, None]})
+
+    out, notes = coerce_to_kinds(frame, {"street_no": "text"})
+
+    assert list(out["street_no"][:2]) == ["112", "19251"]  # not '112.0'
+    assert out["street_no"][2] is None
+    assert any("street_no" in note for note in notes)
+
+
+def test_coerce_reports_values_it_could_not_convert():
+    frame = pd.DataFrame({"consideration": ["1,000", "SEE DEED", None]})
+
+    out, notes = coerce_to_kinds(frame, {"consideration": "numeric"})
+
+    assert out["consideration"][0] == 1000.0
+    assert out["consideration"].isna().sum() == 2
+    assert any("1 value(s) did not convert" in note for note in notes)
+
+
+def test_coerce_is_a_no_op_when_types_already_agree():
+    frame = pd.DataFrame({"consideration": [1.0, 2.0], "liber": ["58620", "58621"]})
+
+    out, notes = coerce_to_kinds(
+        frame, {"consideration": "numeric", "liber": "text"}
+    )
+
+    assert notes == []
+    pd.testing.assert_frame_equal(out, frame)
+
+
+def test_coerce_ignores_columns_the_frame_does_not_have():
+    frame = pd.DataFrame({"liber": ["58620"]})
+
+    out, notes = coerce_to_kinds(frame, {"naive_name_dedupe": "numeric"})
+
+    assert notes == []
+    assert list(out.columns) == ["liber"]

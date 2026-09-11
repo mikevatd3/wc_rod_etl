@@ -1,8 +1,9 @@
 import os
+from decimal import Decimal
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.types import JSON
 from dotenv import load_dotenv
 
@@ -13,10 +14,12 @@ from transforms import (
     align_v2,
     check_v2_header,
     clean_parcel_id,
+    coerce_to_kinds,
     detect_encoding,
     iter_record_groups,
     load_record_cols,
     normalize_v2,
+    parse_consideration,
     read_v2,
     source_layout,
     validate_v2,
@@ -26,6 +29,30 @@ from transforms import (
 WORKING_DIR = Path(__file__).parent
 
 engine = create_engine("postgresql+psycopg://mike@edw:5432/ipds")
+
+
+def column_kinds(table: str) -> dict[str, str]:
+    """{column: 'numeric'|'text'} for a table that already exists in rod."""
+    inspector = inspect(engine)
+
+    if not inspector.has_table(table, schema="rod"):
+        return {}
+
+    kinds = {}
+    for column in inspector.get_columns(table, schema="rod"):
+        try:
+            python_type = column["type"].python_type
+        except NotImplementedError:  # e.g. JSON
+            continue
+
+        if issubclass(python_type, bool):
+            continue
+        elif issubclass(python_type, (int, float, Decimal)):
+            kinds[column["name"]] = "numeric"
+        elif issubclass(python_type, str):
+            kinds[column["name"]] = "text"
+
+    return kinds
 
 
 def main():
@@ -43,12 +70,22 @@ def main():
     table_modes: dict[str, str] = {}
 
     def write_table(frame, table, **kwargs):
+        mode = table_modes.get(table, "replace")
+
+        if mode == "append":
+            # The table's types were set by whichever source wrote it first.
+            # Match them rather than letting the insert fail on, say, a street
+            # number that one layout writes as a number and another as text.
+            frame, notes = coerce_to_kinds(frame, column_kinds(table))
+            for note in notes:
+                print(f"  {table} -- {note}")
+
         frame.to_sql(
             table,
             engine,
             schema="rod",
             index=False,
-            if_exists=table_modes.get(table, "replace"),
+            if_exists=mode,
             **kwargs,
         )
         table_modes[table] = "append"
@@ -139,6 +176,12 @@ def main():
                         format="%Y-%m-%d",
                         errors="coerce",
                     ).dt.date
+                )
+
+                # v1 sources land this as a number, v2 formats it with
+                # thousands separators -- the column is double precision.
+                frame["consideration"] = parse_consideration(
+                    frame["consideration"]
                 )
 
                 write_table(frame, table_names[name])  # type: ignore

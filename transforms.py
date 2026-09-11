@@ -223,6 +223,93 @@ def split_address(series: pd.Series) -> pd.DataFrame:
     return out.apply(_blank_to_none)
 
 
+def parse_consideration(series: pd.Series) -> pd.Series:
+    """'33,500.00' -> 33500.0.
+
+    rod.documents.consideration is a double precision column, and v2 formats
+    the value with thousands separators. Beyond the type mismatch on insert,
+    leaving it as text would stop sql/0001 collapsing a v2 document against the
+    v1 row for the same instrument, since that dedupe groups on the value.
+    """
+    return to_number(series)
+
+
+def to_number(series: pd.Series) -> pd.Series:
+    """Numbers out of whatever the source wrote, currency formatting included."""
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+
+    # Cleaned per value rather than through the .str accessor, which refuses a
+    # column that is already numeric or holds a mix of numbers and text.
+    cleaned = series.map(
+        lambda value: re.sub(r"[$,\s]", "", value)
+        if isinstance(value, str)
+        else value
+    )
+
+    return pd.to_numeric(cleaned, errors="coerce").astype("float64")
+
+
+def _to_text(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+
+    # A street number that pandas read as 112.0 belongs in a text column as
+    # '112', not '112.0'.
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+
+    return str(value)
+
+
+def coerce_to_kinds(
+    frame: pd.DataFrame, kinds: dict[str, str]
+) -> tuple[pd.DataFrame, list[str]]:
+    """Cast columns to match the types the target table already has.
+
+    Appending to a table that pandas created from an earlier source means
+    living with whatever types that source implied -- a street number the first
+    file happened to write as digits makes a numeric column, and a later source
+    writing '112' is rejected outright. Rather than fail the load, cast to what
+    is already there and say so.
+
+    Dates are left alone: they are coerced explicitly where they are loaded.
+
+    Returns the frame and a note per column changed.
+    """
+    frame = frame.copy()
+    notes = []
+
+    for column, kind in kinds.items():
+        if column not in frame.columns:
+            continue
+
+        before = frame[column]
+
+        if kind == "numeric" and not pd.api.types.is_numeric_dtype(before):
+            after = to_number(before)
+        elif kind == "text" and pd.api.types.is_numeric_dtype(before):
+            # Built directly rather than with .map, which turns the None
+            # back into NaN.
+            after = pd.Series(
+                [_to_text(value) for value in before],
+                index=before.index,
+                dtype=object,
+            )
+        else:
+            continue
+
+        note = f"cast {column} to {kind} to match the existing column"
+        unconvertible = int(after.isna().sum() - before.isna().sum())
+        if unconvertible > 0:
+            note += f" -- {unconvertible} value(s) did not convert and are null"
+
+        notes.append(note)
+        frame[column] = after
+
+    return frame, notes
+
+
 def _base(frame: pd.DataFrame, code: str) -> pd.DataFrame:
     """The doc-level slots plus the record code, aligned to frame's index."""
     return pd.DataFrame(
@@ -248,9 +335,8 @@ def v2_documents(frame: pd.DataFrame) -> pd.DataFrame:
     liber = split_liber(doc["LIBER"])
     out["field_5"] = liber["liber"]
     out["field_6"] = liber["page"]
-    # Consideration stays a verbatim string ('33,500.00'): sql/0001 dedupes on
-    # the literal value, so parsing it here would stop v2 rows collapsing
-    # against the v1 rows for the same document.
+    # Left as it appears in the file -- parse_consideration normalises it at
+    # the write boundary, for both layouts.
     out["field_10"] = _blank_to_none(doc["CONSIDERATION"])
     # DM_INSTRUMENT is the document date, despite the name.
     out["field_11"] = _blank_to_none(doc["DM_INSTRUMENT"])

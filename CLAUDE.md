@@ -19,6 +19,8 @@ Source CSVs are not reliably UTF-8 — they come off Windows, and one stray byte
 
 `transforms.py:normalize_v2` then reshapes a v2 frame into the v1 positional intermediate, so both layouts land in the same `rod.*` tables with the same column names and nothing in `sql/` has to change. `layout` is orthogonal to `is_file`, so a v2 source staged as a `raw.*` table works too.
 
+Because the `rod.*` tables are created implicitly by `to_sql`, their column types are whatever the *first* source to write each table implied — `documents.consideration` is `double precision`, for instance. On append, `write_table` casts the frame to the types the table already has (`transforms.py:coerce_to_kinds`) and logs each cast, so a value one layout writes as `33,500.00` and another as `33500.0` does not abort the load. Anything that will not convert is logged and nulled.
+
 Sample: `rod_new_schema_example.csv`.
 
 ## Key files
