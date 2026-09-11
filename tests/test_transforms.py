@@ -13,6 +13,7 @@ from transforms import (
     V2_COLUMNS,
     align_v2,
     check_v2_header,
+    detect_encoding,
     clean_parcel_id,
     iter_record_groups,
     load_record_cols,
@@ -409,3 +410,47 @@ def test_read_v2_names_the_missing_columns_and_the_real_header(tmp_path):
 
     assert "CF_VCINSTNUM" in str(error.value)
     assert "WHO_KNOWS" in str(error.value)  # shows what the file actually has
+
+
+
+def test_detect_encoding_finds_utf8(tmp_path):
+    path = tmp_path / "utf8.csv"
+    path.write_text("A,B\nMÜLLER,x\n", encoding="utf-8")
+
+    assert detect_encoding(path) == "utf-8"
+
+
+def test_detect_encoding_falls_back_for_a_windows_export(tmp_path):
+    path = tmp_path / "cp1252.csv"
+    path.write_bytes("A,B\nM\u00dcLLER,x\n".encode("cp1252"))
+
+    assert detect_encoding(path) == "cp1252"
+
+
+def test_read_v2_handles_a_non_utf8_export(tmp_path):
+    # The 0xDC byte that aborted a real load: cp1252 'U with umlaut', thousands
+    # of rows into an otherwise plain-ascii file.
+    header = list(V2_COLUMNS)
+    rows = [
+        ["DD", "2024-01-02", "2024005182", "58620:573", "0", "2023-12-15"]
+        + [name, "", "", "", "", "", "", "", "", "", "", "", ""]
+        for name in ("SMITH HARRY J", "M\u00dcLLER HANS")
+    ]
+    path = tmp_path / "latin.csv"
+    path.write_bytes(
+        ("\n".join([",".join(header)] + [",".join(r) for r in rows]) + "\n").encode(
+            "cp1252"
+        )
+    )
+
+    frame = read_v2(path)
+
+    assert set(v2_parties(frame)["field_6"]) == {"SMITH HARRY J", "M\u00dcLLER HANS"}
+
+
+def test_detect_encoding_reads_across_chunk_boundaries(tmp_path):
+    # A multi-byte character split across two reads must not be misreported.
+    path = tmp_path / "big.csv"
+    path.write_text("A\n" + ("x" * 5000) + "\u00e9\n", encoding="utf-8")
+
+    assert detect_encoding(path, chunk_size=64) == "utf-8"

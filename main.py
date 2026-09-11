@@ -13,6 +13,7 @@ from transforms import (
     align_v2,
     check_v2_header,
     clean_parcel_id,
+    detect_encoding,
     iter_record_groups,
     load_record_cols,
     normalize_v2,
@@ -66,13 +67,19 @@ def main():
         if source["is_file"]:  # type: ignore
             path = vault_location / source["source"]  # type: ignore
 
+            # These exports are not reliably UTF-8, and a single stray byte
+            # aborts the parse thousands of rows in.
+            encoding = detect_encoding(path)
+            if encoding != "utf-8":
+                print(f"  encoding -- not utf-8, decoding as {encoding}")
+
             if layout == "v2":
                 # v2 files carry a header, so they are read by name -- no
                 # positional names, and the column count can change.
-                for problem in check_v2_header(path):
+                for problem in check_v2_header(path, encoding=encoding):
                     print(f"  header -- {problem}")
 
-                frame = read_v2(path)
+                frame = read_v2(path, encoding=encoding)
             else:
                 frame = pd.read_csv(
                     path,
@@ -80,6 +87,7 @@ def main():
                     usecols=range(
                         len(FIELD_COLUMNS)
                     ),  # There are extra columns on a couple hundred rows
+                    encoding=encoding,
                 )
         else:
             with engine.connect() as db:

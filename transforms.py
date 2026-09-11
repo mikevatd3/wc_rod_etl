@@ -23,6 +23,7 @@ the source files in the vault.
 """
 
 from pathlib import Path
+import codecs
 import csv
 import re
 
@@ -65,6 +66,11 @@ V2_DOC_COLUMNS = V2_COLUMNS[:6]
 # return None. CF_VCINSTNUM is left to infer so instrument_no keeps the dtype
 # v1 produces.
 V2_DTYPES = {col: str for col in V2_COLUMNS if col != "CF_VCINSTNUM"}
+
+# Tried in order against a source file. latin-1 maps every possible byte, so
+# it is the backstop that always succeeds; cp1252 sits ahead of it because
+# these reports come off Windows and it decodes the printable range correctly.
+SOURCE_ENCODINGS = ("utf-8", "cp1252", "latin-1")
 
 # The Textbox columns are report-generator labels, so a file without them is
 # still perfectly loadable. Everything else has to be there.
@@ -382,14 +388,14 @@ def align_v2(frame: pd.DataFrame) -> pd.DataFrame:
     return frame.reindex(columns=V2_COLUMNS)
 
 
-def check_v2_header(path: Path) -> list[str]:
+def check_v2_header(path: Path, encoding: str | None = None) -> list[str]:
     """Differences between a v2 file's header and the expected layout.
 
     Everything reported here is survivable -- align_v2 raises on the ones that
     are not -- but they are worth seeing in the log.
     """
-    with open(path) as f:
-        header = [column.strip() for column in next(csv.reader(f), [])]
+    encoding = encoding or detect_encoding(path)
+    header = [column.strip() for column in _read_header(path, encoding)]
 
     problems = []
 
@@ -408,12 +414,38 @@ def check_v2_header(path: Path) -> list[str]:
     return problems
 
 
-def _read_header(path) -> list[str]:
-    with open(path, newline="") as f:
+def detect_encoding(path, chunk_size: int = 1 << 20) -> str:
+    """The first encoding in SOURCE_ENCODINGS that decodes the whole file.
+
+    These exports are generated on Windows and are not always UTF-8 -- a single
+    stray byte (an accented character in a name, say) aborts the parse
+    thousands of rows in. Decoding incrementally keeps this cheap: UTF-8 fails
+    at the first bad byte, and the file is never held in memory twice.
+    """
+    for encoding in SOURCE_ENCODINGS:
+        decoder = codecs.getincrementaldecoder(encoding)()
+
+        try:
+            with open(path, "rb") as f:
+                while chunk := f.read(chunk_size):
+                    decoder.decode(chunk)
+
+                decoder.decode(b"", final=True)
+
+            return encoding
+        except UnicodeDecodeError:
+            continue
+
+    # latin-1 maps every byte, so this is only reachable if it is dropped.
+    return SOURCE_ENCODINGS[-1]
+
+
+def _read_header(path, encoding: str) -> list[str]:
+    with open(path, newline="", encoding=encoding) as f:
         return next(csv.reader(f), [])
 
 
-def read_v2(path) -> pd.DataFrame:
+def read_v2(path, encoding: str | None = None) -> pd.DataFrame:
     """Read a v2 CSV, selecting columns by the file's own header.
 
     Nothing is passed positionally: the file decides how many columns it has
@@ -421,7 +453,8 @@ def read_v2(path) -> pd.DataFrame:
     extra fields these exports carry on a handful of rows, which would
     otherwise abort the parse.
     """
-    header = _read_header(path)
+    encoding = encoding or detect_encoding(path)
+    header = _read_header(path, encoding)
 
     missing = [
         col
@@ -439,7 +472,15 @@ def read_v2(path) -> pd.DataFrame:
     # align_v2 trim the names and order them.
     wanted = [name for name in header if name.strip() in V2_COLUMNS]
 
-    return align_v2(pd.read_csv(path, header=0, usecols=wanted, dtype=V2_DTYPES))
+    return align_v2(
+        pd.read_csv(
+            path,
+            header=0,
+            usecols=wanted,
+            dtype=V2_DTYPES,
+            encoding=encoding,
+        )
+    )
 
 
 if __name__ == "__main__":
@@ -449,13 +490,17 @@ if __name__ == "__main__":
 
     source = Path(sys.argv[1])
 
-    problems = check_v2_header(source)
+    encoding = detect_encoding(source)
+    if encoding != "utf-8":
+        print(f"Not utf-8, decoding as {encoding}")
+
+    problems = check_v2_header(source, encoding=encoding)
     if problems:
         print("Header does not match the expected v2 layout:")
         for problem in problems:
             print(f"  {problem}")
 
-    frame = read_v2(source)
+    frame = read_v2(source, encoding=encoding)
 
     for key, value in validate_v2(frame).items():
         print(f"{key}: {value}")

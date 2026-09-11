@@ -15,6 +15,8 @@ Two source layouts are supported, declared per source in the `layout` column of 
 
 v1 is read positionally; **v2 is read by column name** from the file's own header (`transforms.py:read_v2`), so a v2 export can gain, lose or reorder columns and still load — extra columns are ignored, the optional `Textbox*` labels are filled in when absent, and a genuinely missing data column raises an error naming it. Selecting by name also absorbs the stray extra fields these exports carry on a handful of rows.
 
+Source CSVs are not reliably UTF-8 — they come off Windows, and one stray byte aborts a parse thousands of rows in. `transforms.py:detect_encoding` picks the first of `utf-8`, `cp1252`, `latin-1` that decodes the whole file, and both layouts read with it. The log says so whenever a file is not UTF-8.
+
 `transforms.py:normalize_v2` then reshapes a v2 frame into the v1 positional intermediate, so both layouts land in the same `rod.*` tables with the same column names and nothing in `sql/` has to change. `layout` is orthogonal to `is_file`, so a v2 source staged as a `raw.*` table works too.
 
 Sample: `rod_new_schema_example.csv`.
